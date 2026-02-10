@@ -1,13 +1,13 @@
-# 炒股高手 AI 智能体规划
+# 炒股高手 AI 智能体
 
 ## 🎯 核心功能模块
 
 ### 1. **数据获取层**
-- 实时股票行情数据（价格、成交量、涨跌幅）
-- 历史K线数据（日线、周线、月线）
-- 财务数据（财报、利润、负债等）
-- 新闻资讯和公告信息
-- 宏观经济数据
+- A股实时股票行情（价格、成交量、涨跌幅）
+- A股历史K线数据（日线、周线、月线）
+- 财务数据（已接入：财务摘要 + 多期历史对比 + 更多指标 + 口径/质量说明 + 单位一致性校验）
+- 新闻资讯和公告信息（已接入：新闻+公告+摘要）
+- 宏观经济数据（待接入）
 
 ### 2. **分析引擎层**
 - **技术分析**：均线、MACD、KDJ、RSI、布林带等指标
@@ -34,7 +34,7 @@
 | 步骤       | 内容            | 所需工具/技术                     |
 | ---------- | --------------- | --------------------------------- |
 | **Step 1** | 搭建基础框架    | LangChain / OpenAI API            |
-| **Step 2** | 接入股票数据API | AKShare / Tushare / Yahoo Finance |
+| **Step 2** | 接入股票数据源 | 新浪财经网页数据（免 Token） |
 | **Step 3** | 实现工具函数    | 查询股票、获取K线、计算指标       |
 | **Step 4** | 设计Agent提示词 | System Prompt 角色设定            |
 | **Step 5** | 集成分析能力    | 技术指标库 (TA-Lib / pandas_ta)   |
@@ -43,45 +43,32 @@
 
 ---
 
-## 🛠️ 需要实现的 Agent Tools
+## 🛠️ 当前已实现的 Agent Tools
 
 ```
-1. get_stock_info(code)        - 获取股票基本信息
-2. get_realtime_quote(code)    - 获取实时行情
-3. get_kline_data(code, period)- 获取K线数据
-4. calculate_indicators(code)  - 计算技术指标
-5. get_stock_news(code)        - 获取相关新闻
-6. get_financial_data(code)    - 获取财务数据
-7. analyze_trend(code)         - 趋势分析
-8. search_stock(keyword)       - 搜索股票
+1. get_stock_info(code)        - 获取股票基本信息（A股，含实时行情）
+2. get_realtime_quote(code)    - 获取实时行情（A股）
+3. get_kline_data(code, period)- 获取K线数据（A股）
+4. calculate_indicators(code)  - 计算技术指标（A股）
+5. get_stock_news(code)        - 获取相关新闻/公告（已接入）
+6. get_financial_data(code)    - 获取财务数据（已接入：多期历史对比 + 更多指标 + 口径/质量说明 + 单位一致性校验）
+7. analyze_trend(code)         - 趋势分析（A股）
+8. search_stock(keyword)       - 搜索股票（已接入）
 ```
 
 ---
 
-## 🏗️ 建议的项目结构
+## 🏗️ 当前项目结构
 
 ```
 stock_agent/
 ├── agent.py           # 主Agent入口
 ├── tools/
 │   ├── stock_data.py  # 股票数据获取
-│   ├── analysis.py    # 技术分析工具
-│   └── news.py        # 新闻资讯工具
 ├── prompts/
 │   └── system.py      # 系统提示词
-├── utils/
-│   └── indicators.py  # 指标计算
 └── config.py          # 配置文件
 ```
-
----
-
-## 🚀 下一步建议
-
-1. **先从简单开始**：实现一个能查询股票实时行情的基础Agent
-2. **逐步增加工具**：添加K线查询、指标计算等功能
-3. **完善提示词**：让AI更像专业的投资顾问
-4. **添加高级功能**：多股对比、选股策略等
 
 ---
 

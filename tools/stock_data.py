@@ -14,6 +14,9 @@ from datetime import datetime
 import re
 import json
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
 
 def _normalize_cn_symbol(stock_code: str) -> str:
     code = stock_code.strip().lower()
@@ -28,14 +31,42 @@ def _normalize_cn_symbol(stock_code: str) -> str:
     return code
 
 
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+_SESSION = _build_session()
+
+
 def _sina_request(url: str) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://finance.sina.com.cn/",
     }
-    resp = requests.get(url, headers=headers, timeout=10)
-    resp.encoding = "gbk"
+    resp = _SESSION.get(url, headers=headers, timeout=10)
+    resp.encoding = resp.apparent_encoding or "gbk"
+    return resp.text
+
+
+def _sina_html_request(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://finance.sina.com.cn/",
+    }
+    resp = _SESSION.get(url, headers=headers, timeout=10)
+    resp.encoding = resp.apparent_encoding or "gbk"
     return resp.text
 
 
@@ -44,6 +75,235 @@ def _parse_jsonp(text: str):
     if not match:
         return []
     return json.loads(match.group(1))
+
+
+def _parse_sina_suggest(text: str):
+    match = re.search(r'="(.*)"', text)
+    if not match:
+        return []
+    payload = match.group(1).strip()
+    if not payload:
+        return []
+    items = payload.split(";")
+    results = []
+    for item in items:
+        parts = item.split(",")
+        if len(parts) < 2:
+            continue
+        symbol = parts[0]
+        name = parts[1]
+        market = "A股"
+        if symbol.startswith("sh"):
+            market = "上证"
+        elif symbol.startswith("sz"):
+            market = "深证"
+        elif symbol.startswith("bj"):
+            market = "北交所"
+        results.append({"symbol": symbol, "name": name, "market": market})
+    return results
+
+
+def _extract_article_summary(url: str) -> str:
+    try:
+        html = _sina_html_request(url)
+        soup = BeautifulSoup(html, "html.parser")
+        meta = soup.find("meta", attrs={"name": "description"})
+        if meta and meta.get("content"):
+            return meta.get("content").strip()
+
+        selectors = [
+            "div.article p",
+            "div.article-content p",
+            "div.main-content p",
+            "div#artibody p",
+        ]
+        for sel in selectors:
+            p = soup.select_one(sel)
+            if p and p.get_text(strip=True):
+                return p.get_text(strip=True)
+        return ""
+    except Exception:
+        return ""
+
+
+def _strip_summaries(items: list[dict]) -> list[dict]:
+    return [{"title": i.get("title", ""), "url": i.get("url", ""), "date": i.get("date", "")}
+            for i in items if i.get("title")]
+
+
+def _parse_company_news(symbol: str, limit: int) -> list[dict]:
+    url = f"https://finance.sina.com.cn/realstock/company/{symbol}/nc.shtml"
+    html = _sina_html_request(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    items = []
+    selectors = [
+        "div.datelist ul li",
+        "div.datelist li",
+        "ul.list li",
+        "div.newslist li",
+        "div#newslist li",
+    ]
+    for li in soup.select(",".join(selectors)):
+        a = li.find("a", href=True)
+        if not a:
+            continue
+        title = a.get_text(strip=True)
+        if not title or len(title) < 4:
+            continue
+        href = a["href"]
+        if href.startswith("/"):
+            href = f"https://finance.sina.com.cn{href}"
+        if not href.startswith("http"):
+            continue
+        date_match = re.search(r"\d{4}-\d{2}-\d{2}", li.get_text(" ", strip=True))
+        date_text = date_match.group(0) if date_match else ""
+        items.append({"title": title, "url": href, "date": date_text})
+
+    unique = []
+    seen = set()
+    for item in items:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        unique.append(item)
+        if len(unique) >= limit:
+            break
+
+    for item in unique:
+        item["summary"] = _extract_article_summary(item["url"])
+    return unique
+
+
+def _parse_company_announcements(symbol: str, limit: int) -> list[dict]:
+    url = f"https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletin.php?symbol={symbol}"
+    html = _sina_html_request(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    rows = soup.select("table#DataTable tr, table tr")
+    items = []
+    for row in rows:
+        a = row.find("a", href=True)
+        tds = row.find_all("td")
+        if not a or not tds:
+            continue
+        title = a.get_text(strip=True)
+        date_text = tds[-1].get_text(strip=True) if len(tds) >= 2 else ""
+        href = a["href"]
+        if href and href.startswith("/"):
+            href = f"https://vip.stock.finance.sina.com.cn{href}"
+        if href and not href.startswith("http"):
+            continue
+        items.append({"title": title, "url": href, "date": date_text})
+
+    unique = []
+    seen = set()
+    for item in items:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        unique.append(item)
+        if len(unique) >= limit:
+            break
+
+    for item in unique:
+        item["summary"] = _extract_article_summary(item["url"])
+    return unique
+
+
+def _parse_financial_summary(symbol: str) -> dict:
+    url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vFD_FinanceSummary/stockid/{symbol[2:]}.phtml"
+    html = _sina_html_request(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    data = {}
+    for row in soup.select("table tr"):
+        cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"]) if c.get_text(strip=True)]
+        if len(cells) < 2:
+            continue
+        key = cells[0]
+        val = cells[1]
+        if key and val:
+            data[key] = val
+
+    return data
+
+
+def _parse_financial_table(symbol: str) -> tuple[list[str], dict]:
+    url = f"https://vip.stock.finance.sina.com.cn/corp/go.php/vFD_FinanceSummary/stockid/{symbol[2:]}.phtml"
+    html = _sina_html_request(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    date_pattern = re.compile(r"\d{4}[-./]\d{2}[-./]\d{2}")
+    best_periods = []
+    best_rows = {}
+
+    for table in soup.select("table"):
+        header_cells = table.select("tr th")
+        headers = [c.get_text(strip=True) for c in header_cells]
+        if not headers:
+            continue
+        periods = [h for h in headers if date_pattern.search(h)]
+        if len(periods) < 2:
+            continue
+
+        rows = {}
+        for tr in table.select("tr"):
+            cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"]) if c.get_text(strip=True)]
+            if len(cells) < len(periods) + 1:
+                continue
+            key = cells[0]
+            values = cells[1:1 + len(periods)]
+            rows[key] = values
+
+        if len(rows) > len(best_rows):
+            best_periods = periods
+            best_rows = rows
+
+    return best_periods, best_rows
+
+
+def _to_number(value: str) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in {"--", "N/A", "-"}:
+        return None
+    text = text.replace(",", "").replace("%", "")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _normalize_metric_value(value: str) -> tuple[str, str]:
+    if value is None:
+        return "--", ""
+    text = str(value).strip()
+    if not text:
+        return "--", ""
+    note = ""
+    if "%" in text:
+        note = "(百分比)"
+    elif any(unit in text for unit in ["亿", "万", "千", "百"]):
+        note = "(含单位)"
+    return text, note
+
+
+def _detect_unit(value: str) -> str:
+    if not value:
+        return ""
+    for unit in ["亿", "万", "千", "百"]:
+        if unit in value:
+            return unit
+    return ""
+
+
+def _unit_consistency(values: list[str]) -> tuple[bool, str]:
+    units = {u for u in (_detect_unit(v) for v in values) if u}
+    if len(units) > 1:
+        return False, f"单位不一致({','.join(sorted(units))})"
+    return True, ""
 
 
 def _get_candles_sina(stock_code: str, days: int) -> pd.DataFrame:
@@ -222,7 +482,25 @@ def search_stock(keyword: str) -> str:
         匹配的股票列表
     """
     try:
-        return "⚠️ 新浪财经搜索接口暂未接入"
+        key = keyword.strip()
+        if not key:
+            return "❌ 请输入有效的搜索关键词"
+
+        url = f"https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key={key}"
+        text = _sina_request(url)
+        results = _parse_sina_suggest(text)
+
+        if not results:
+            return f"❌ 未找到包含 '{keyword}' 的股票"
+
+        result = f"🔍 搜索结果 - '{keyword}'\n"
+        result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        for row in results[:10]:
+            result += f"📌 {row['symbol']} {row['name']} ({row['market']})\n"
+        result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        result += f"共找到 {min(len(results), 10)} 只股票\n"
+        result += "💡 数据来源: 新浪财经\n"
+        return result
     except Exception as e:
         return f"❌ 搜索失败: {str(e)}"
 
@@ -409,7 +687,64 @@ def get_stock_news(stock_code: str, count: int = 10) -> str:
         股票相关新闻列表的字符串描述
     """
     try:
-        return "⚠️ 新浪财经新闻接口暂未接入"
+        symbol = _normalize_cn_symbol(stock_code)
+        news_count = max(1, count // 2)
+        ann_count = max(1, count - news_count)
+
+        news_items = _parse_company_news(symbol, news_count)
+        ann_items = _parse_company_announcements(symbol, ann_count)
+
+        summary_failed = False
+        if news_items and all(not i.get("summary") for i in news_items):
+            summary_failed = True
+            news_items = _strip_summaries(news_items)
+        if ann_items and all(not i.get("summary") for i in ann_items):
+            summary_failed = True
+            ann_items = _strip_summaries(ann_items)
+
+        if not news_items and not ann_items:
+            return f"❌ 未找到 {stock_code} 的相关新闻或公告"
+
+        result = f"""
+📰 新闻/公告 - {stock_code}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+        if news_items:
+            result += "📌 【公司新闻】\n"
+            for idx, item in enumerate(news_items, start=1):
+                summary = item.get("summary", "")
+                if len(summary) > 120:
+                    summary = summary[:120] + "..."
+                result += f"{idx}. {item['title']}\n"
+                if item.get("date"):
+                    result += f"   🕐 {item['date']}\n"
+                if summary:
+                    result += f"   📝 {summary}\n"
+                if item.get("url"):
+                    result += f"   🔗 {item['url']}\n"
+            result += "\n"
+
+        if ann_items:
+            result += "📣 【公司公告】\n"
+            for idx, item in enumerate(ann_items, start=1):
+                summary = item.get("summary", "")
+                if len(summary) > 120:
+                    summary = summary[:120] + "..."
+                result += f"{idx}. {item['title']}\n"
+                if item.get("date"):
+                    result += f"   🕐 {item['date']}\n"
+                if summary:
+                    result += f"   📝 {summary}\n"
+                if item.get("url"):
+                    result += f"   🔗 {item['url']}\n"
+
+        if summary_failed:
+            result += "\n⚠️ 摘要获取失败，已降级为仅标题列表\n"
+        result += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        result += f"共获取 {len(news_items) + len(ann_items)} 条新闻/公告\n"
+        result += "💡 数据来源: 新浪财经\n"
+        return result
     except Exception as e:
         return f"❌ 获取新闻失败: {str(e)}"
 
@@ -427,7 +762,106 @@ def get_financial_data(stock_code: str) -> str:
         财务数据分析结果的字符串描述
     """
     try:
-        return "⚠️ 新浪财经财务数据接口暂未接入"
+        symbol = _normalize_cn_symbol(stock_code)
+        periods, rows = _parse_financial_table(symbol)
+        summary = _parse_financial_summary(symbol)
+        if not summary and not rows:
+            return f"⚠️ 未找到 {stock_code} 的财务数据"
+
+        pick_keys = [
+            "每股收益",
+            "每股净资产",
+            "每股现金流",
+            "每股公积金",
+            "每股未分配利润",
+            "净资产收益率(%)",
+            "总资产收益率(%)",
+            "资产负债率(%)",
+            "毛利率(%)",
+            "净利率(%)",
+            "营业收入",
+            "营业利润",
+            "净利润",
+            "息税前利润",
+            "经营活动现金流量净额",
+            "投资活动现金流量净额",
+            "筹资活动现金流量净额",
+            "市盈率(动态)",
+            "市盈率(静态)",
+            "市净率",
+            "总资产",
+            "总负债",
+            "货币资金",
+            "应收账款",
+            "存货",
+        ]
+
+        result = f"""
+💰 财务数据分析 - {stock_code}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+        result += "口径说明：财务摘要与历史对比来自同一页面表格，默认按披露期口径展示。\n"
+        result += "数据质量提示：若页面字段缺失或单位不统一，结果可能出现缺项或单位混杂。\n\n"
+
+        if periods and rows:
+            show_periods = periods[:3]
+            period_labels = " | ".join([f"期{i+1}:{p}" for i, p in enumerate(show_periods)])
+            result += f"披露期(最新优先): {period_labels}\n\n"
+
+            for key in pick_keys:
+                if key not in rows:
+                    continue
+                values = rows[key]
+                latest_raw = values[0] if len(values) > 0 else ""
+                prev_raw = values[1] if len(values) > 1 else ""
+                prev2_raw = values[2] if len(values) > 2 else ""
+                latest_val, latest_note = _normalize_metric_value(latest_raw)
+                prev_val, prev_note = _normalize_metric_value(prev_raw)
+                prev2_val, prev2_note = _normalize_metric_value(prev2_raw)
+                delta_text = ""
+                n_latest = _to_number(latest_raw)
+                n_prev = _to_number(prev_raw)
+                if n_latest is not None and n_prev is not None and n_prev != 0:
+                    delta = n_latest - n_prev
+                    pct = delta / n_prev * 100
+                    delta_text = f"  变动: {delta:+.2f} ({pct:+.2f}%)"
+                unit_ok, unit_note = _unit_consistency([latest_raw, prev_raw, prev2_raw])
+                result += f"{key}: {latest_val}"
+                if latest_note:
+                    result += f" {latest_note}"
+                if prev_val:
+                    result += f"  上期: {prev_val}"
+                    if prev_note:
+                        result += f" {prev_note}"
+                if prev2_val:
+                    result += f"  上上期: {prev2_val}"
+                    if prev2_note:
+                        result += f" {prev2_note}"
+                if delta_text:
+                    result += delta_text
+                if not unit_ok and unit_note:
+                    result += f"  ⚠️ {unit_note}"
+                result += "\n"
+        else:
+            hit = 0
+            for key in pick_keys:
+                if key in summary:
+                    result += f"{key}: {summary[key]}\n"
+                    hit += 1
+            if hit == 0:
+                for k, v in list(summary.items())[:12]:
+                    result += f"{k}: {v}\n"
+
+        result += "\n指标口径补充:\n"
+        result += "- 每股收益/净资产/现金流：以每股口径展示，单位随页面披露\n"
+        result += "- 净资产收益率/总资产收益率/毛利率/净利率：百分比口径\n"
+        result += "- 营业收入/净利润/现金流净额：报告期累计值\n"
+        result += "- 市盈率/市净率：按当期口径或页面标注\n"
+        result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        result += "💡 数据来源: 新浪财经\n"
+        result += "⚠️ 财务数据仅供参考，投资需综合分析\n"
+        return result
     except Exception as e:
         return f"❌ 获取财务数据失败: {str(e)}"
 
