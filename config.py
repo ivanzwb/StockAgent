@@ -3,7 +3,7 @@
 """
 
 # API 配置 (使用阿里云百炼 API，兼容 OpenAI 格式)
-API_KEY = "sk-8b17fe6391a4478dadcb98f2be6e7608"
+API_KEY = ""
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_NAME = "qwen-max"
 
