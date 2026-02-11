@@ -8,5 +8,5 @@ BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODEL_NAME = "qwen-max"
 
 # Agent 配置
-TEMPERATURE = 0.7
+TEMPERATURE = 0.2
 MAX_ITERATIONS = 10  # Agent 最大迭代次数

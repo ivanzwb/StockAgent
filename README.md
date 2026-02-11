@@ -72,6 +72,10 @@ stock_agent/
 ```
 
 ---
+## 启动
+StockAgent/.venv/Scripts/python.exe agent.py
+
+---
 
 ## ⚠️ 风险提示
 
