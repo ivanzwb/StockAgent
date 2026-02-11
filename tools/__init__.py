@@ -9,7 +9,8 @@ from .stock_data import (
     calculate_indicators,
     get_stock_news,
     get_financial_data,
-    analyze_trend
+    analyze_trend,
+    select_stocks
 )
 
 __all__ = [
@@ -20,5 +21,6 @@ __all__ = [
     "calculate_indicators",
     "get_stock_news",
     "get_financial_data",
-    "analyze_trend"
+    "analyze_trend",
+    "select_stocks"
 ]

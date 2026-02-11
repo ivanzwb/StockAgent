@@ -54,6 +54,7 @@
 6. get_financial_data(code)    - 获取财务数据（已接入：多期历史对比 + 更多指标 + 口径/质量说明 + 单位一致性校验）
 7. analyze_trend(code)         - 趋势分析（A股）
 8. search_stock(keyword)       - 搜索股票（已接入）
+9. select_stocks(keyword)      - 选股（已接入：技术面筛选）
 ```
 
 ---

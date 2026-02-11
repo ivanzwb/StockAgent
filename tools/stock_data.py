@@ -56,6 +56,7 @@ def _sina_request(url: str) -> str:
     }
     resp = _SESSION.get(url, headers=headers, timeout=10)
     resp.encoding = resp.apparent_encoding or "gbk"
+    print(f"[DEBUG] GET {url} status={resp.status_code} len={len(resp.text)}")
     return resp.text
 
 
@@ -67,6 +68,7 @@ def _sina_html_request(url: str) -> str:
     }
     resp = _SESSION.get(url, headers=headers, timeout=10)
     resp.encoding = resp.apparent_encoding or "gbk"
+    print(f"[DEBUG] GET {url} status={resp.status_code} len={len(resp.text)}")
     return resp.text
 
 
@@ -101,6 +103,196 @@ def _parse_sina_suggest(text: str):
             market = "北交所"
         results.append({"symbol": symbol, "name": name, "market": market})
     return results
+
+
+def _normalize_keyword_for_search(keyword: str) -> str:
+    key = re.sub(r"\s+", "", keyword or "").strip()
+    if not key:
+        return ""
+
+    for suffix in ["股票", "股", "板块", "概念", "概念股", "行业", "类", "股份", "有限公司", "有限责任公司"]:
+        if key.endswith(suffix):
+            key = key[: -len(suffix)]
+            break
+
+    key = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fa5]", "", key)
+    return key
+
+
+def _expand_keyword_candidates(keyword: str) -> list[str]:
+    key = _normalize_keyword_for_search(keyword)
+    if not key:
+        return []
+
+    candidates = [key]
+    if "AI" in key.upper():
+        candidates.append(key.replace("AI", "人工智能"))
+        candidates.append("人工智能")
+    if "智能" in key and "人工智能" not in candidates:
+        candidates.append("人工智能")
+    if "应用" in key:
+        candidates.append(key.replace("应用", ""))
+    if key == "AI应用":
+        candidates.extend(["AI", "人工智能", "AI+应用"])
+
+    return [c for c in dict.fromkeys(candidates) if c]
+
+
+def _eastmoney_request(url: str, params: dict | None = None) -> dict:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.eastmoney.com/",
+    }
+    resp = _SESSION.get(url, headers=headers, params=params, timeout=10)
+    resp.encoding = resp.apparent_encoding or "utf-8"
+    text = resp.text
+    print(f"[DEBUG] GET {url} params={params} status={resp.status_code} len={len(text)}")
+    try:
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            return json.loads(match.group(0))
+        return {}
+
+
+def _search_theme_by_boardlist(keyword: str) -> list[dict]:
+    key = _normalize_keyword_for_search(keyword)
+    if not key:
+        return []
+
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    fs_candidates = ["b:BK", "b:BK0612", "b:BK0707", "b:BK0804"]
+    fields = "f12,f14,f2,f3"
+    results = []
+
+    for fs in fs_candidates:
+        data = _eastmoney_request(url, params={
+            "pn": 1,
+            "pz": 2000,
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": fs,
+            "fields": fields,
+        })
+        diff = data.get("data", {}).get("diff", []) if isinstance(data, dict) else []
+        if not diff:
+            continue
+        for d in diff:
+            if not isinstance(d, dict):
+                continue
+            code = str(d.get("f12", ""))
+            name = str(d.get("f14", ""))
+            if not code or not name:
+                continue
+            if key in name:
+                results.append({"code": code, "name": name, "type": "板块"})
+        if results:
+            break
+
+    return results
+
+
+def _search_theme_eastmoney(keyword: str) -> list[dict]:
+    keys = _expand_keyword_candidates(keyword)
+    if not keys:
+        return []
+
+    url = "https://searchapi.eastmoney.com/api/suggest/get"
+    results = []
+    seen = set()
+
+    for key in keys:
+        for t in [14, 12, 13, 11]:
+            data = _eastmoney_request(url, params={"input": key, "type": t, "count": 20})
+            items = data.get("data", {}).get("list", []) if isinstance(data, dict) else []
+            wdm_items = data.get("WenDongMi", {}).get("Data", []) if isinstance(data, dict) else []
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                code = item.get("code") or item.get("securityCode") or ""
+                name = item.get("name") or item.get("securityName") or ""
+                stype = item.get("typeName") or item.get("securityTypeName") or ""
+                if not code or not name:
+                    continue
+                if "板块" in stype or "行业" in stype or "概念" in stype or item.get("securityType") in {"BK", "B"}:
+                    key_id = f"{code}:{name}"
+                    if key_id in seen:
+                        continue
+                    seen.add(key_id)
+                    results.append({"code": code, "name": name, "type": stype or "板块"})
+
+            for item in wdm_items or []:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("gubaId") or item.get("securityCode") or "").strip()
+                name = str(item.get("securityShortName") or item.get("headCharacter") or "").strip()
+                if not code or not name:
+                    continue
+                key_id = f"stock:{code}:{name}"
+                if key_id in seen:
+                    continue
+                seen.add(key_id)
+                results.append({"code": code, "name": name, "type": "个股", "is_stock": True})
+
+    if not results:
+        results = _search_theme_by_boardlist(keyword)
+    return results
+
+
+def _rank_themes(keyword: str, themes: list[dict]) -> list[dict]:
+    keys = _expand_keyword_candidates(keyword)
+    if not keys:
+        return themes
+    scored = []
+    for item in themes:
+        name = item.get("name", "")
+        score = 0
+        for key in keys:
+            if key and key in name:
+                score += 2
+        if "人工智能" in name or "AI" in name.upper():
+            score += 1
+        scored.append((score, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [i for _, i in scored]
+
+
+def _get_theme_constituents(code: str, limit: int = 50) -> list[dict]:
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    fields = "f12,f14,f2,f3"
+    for fs in [f"b:{code}", f"i:{code}"]:
+        data = _eastmoney_request(url, params={
+            "pn": 1,
+            "pz": limit,
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": fs,
+            "fields": fields,
+        })
+        diff = data.get("data", {}).get("diff", []) if isinstance(data, dict) else []
+        if diff:
+            return [
+                {"symbol": str(d.get("f12", "")), "name": d.get("f14", "") or ""}
+                for d in diff if isinstance(d, dict)
+            ]
+    return []
+
+
+def _search_stock_sina(keyword: str) -> list[dict]:
+    key = _normalize_keyword_for_search(keyword)
+    if not key:
+        return []
+    url = f"https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key={key}"
+    text = _sina_request(url)
+    return _parse_sina_suggest(text)
 
 
 def _extract_article_summary(url: str) -> str:
@@ -335,6 +527,78 @@ def _get_candles_sina(stock_code: str, days: int) -> pd.DataFrame:
     return df
 
 
+def _compute_tech_indicators(df: pd.DataFrame) -> dict:
+    close = df["收盘"].astype(float)
+    volume = df["成交量"].astype(float)
+
+    ma5 = close.rolling(window=5).mean()
+    ma10 = close.rolling(window=10).mean()
+    ma20 = close.rolling(window=20).mean()
+    ma60 = close.rolling(window=60).mean()
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    macd = (dif - dea) * 2
+
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+
+    latest = {
+        "close": close.iloc[-1],
+        "ma5": ma5.iloc[-1],
+        "ma10": ma10.iloc[-1],
+        "ma20": ma20.iloc[-1],
+        "ma60": ma60.iloc[-1],
+        "dif": dif.iloc[-1],
+        "dea": dea.iloc[-1],
+        "macd": macd.iloc[-1],
+        "rsi": rsi.iloc[-1],
+        "volume": volume.iloc[-1],
+        "vol_ma5": volume.rolling(window=5).mean().iloc[-1],
+    }
+    return latest
+
+
+def _score_stock(indicators: dict) -> tuple[int, list[str]]:
+    score = 0
+    reasons = []
+
+    if indicators["ma5"] > indicators["ma10"] > indicators["ma20"]:
+        score += 25
+        reasons.append("均线多头")
+    elif indicators["ma5"] < indicators["ma10"] < indicators["ma20"]:
+        score -= 20
+
+    if indicators["close"] > indicators["ma20"]:
+        score += 15
+    else:
+        score -= 10
+
+    if indicators["macd"] > 0 and indicators["dif"] > indicators["dea"]:
+        score += 15
+        reasons.append("MACD偏强")
+
+    if 40 <= indicators["rsi"] <= 70:
+        score += 10
+        reasons.append("RSI健康")
+    elif indicators["rsi"] > 80:
+        score -= 10
+    elif indicators["rsi"] < 30:
+        score += 5
+
+    if indicators["vol_ma5"] and indicators["volume"] > indicators["vol_ma5"] * 1.2:
+        score += 10
+        reasons.append("放量")
+
+    score = max(0, min(100, score))
+    return score, reasons
+
+
 def _get_candles(symbol: str, resolution: str, days: int) -> pd.DataFrame:
     df = _get_candles_sina(symbol, days)
     if df.empty:
@@ -482,16 +746,30 @@ def search_stock(keyword: str) -> str:
         匹配的股票列表
     """
     try:
-        key = keyword.strip()
-        if not key:
-            return "❌ 请输入有效的搜索关键词"
-
-        url = f"https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key={key}"
-        text = _sina_request(url)
-        results = _parse_sina_suggest(text)
-
+        results = _search_stock_sina(keyword)
         if not results:
-            return f"❌ 未找到包含 '{keyword}' 的股票"
+            themes = _search_theme_eastmoney(keyword)
+            if not themes:
+                return f"❌ 未找到包含 '{keyword}' 的股票或板块"
+            stock_hits = [t for t in themes if t.get("is_stock")]
+            if stock_hits:
+                result = f"🔍 搜索结果 - '{keyword}'\n"
+                result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                for row in stock_hits[:10]:
+                    result += f"📌 {_normalize_cn_symbol(row['code'])} {row['name']} (A股)\n"
+                result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                result += f"共找到 {min(len(stock_hits), 10)} 只股票\n"
+                result += "💡 数据来源: 东方财富\n"
+                return result
+
+            result = f"🧭 板块搜索结果 - '{keyword}'\n"
+            result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            for row in themes[:10]:
+                result += f"📌 {row['code']} {row['name']} ({row['type']})\n"
+            result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            result += f"共找到 {min(len(themes), 10)} 个板块\n"
+            result += "💡 数据来源: 东方财富\n"
+            return result
 
         result = f"🔍 搜索结果 - '{keyword}'\n"
         result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -503,6 +781,80 @@ def search_stock(keyword: str) -> str:
         return result
     except Exception as e:
         return f"❌ 搜索失败: {str(e)}"
+
+
+@tool
+def select_stocks(keyword: str, max_results: int = 10) -> str:
+    """
+    根据关键词搜索A股，并筛选当前更适合买入的股票。
+
+    Args:
+        keyword: 搜索关键词，如 "银行"、"新能源"、"医药"
+        max_results: 返回结果数量，默认10
+
+    Returns:
+        选股结果与简要理由
+    """
+    try:
+        candidates = _search_stock_sina(keyword)
+        if not candidates:
+            themes = _rank_themes(keyword, _search_theme_eastmoney(keyword))
+            if themes:
+                stock_hits = [t for t in themes if t.get("is_stock")]
+                if stock_hits:
+                    candidates = [
+                        {"symbol": _normalize_cn_symbol(t["code"]), "name": t["name"], "market": "A股"}
+                        for t in stock_hits if t.get("code")
+                    ]
+                else:
+                    for theme in themes[:5]:
+                        constituents = _get_theme_constituents(theme["code"], 200)
+                        if not constituents:
+                            continue
+                        candidates = [
+                            {"symbol": _normalize_cn_symbol(x["symbol"]), "name": x["name"], "market": "A股"}
+                            for x in constituents if x.get("symbol")
+                        ]
+                        if candidates:
+                            break
+
+        if not candidates:
+            return "❌ 未找到匹配的股票"
+
+        results = []
+        for item in candidates[: min(len(candidates), max_results)]:
+            symbol = item["symbol"]
+            df = _get_candles_sina(symbol, 120)
+            if df.empty or len(df) < 60:
+                continue
+            indicators = _compute_tech_indicators(df)
+            score, reasons = _score_stock(indicators)
+            if score >= 60:
+                results.append({
+                    "symbol": symbol,
+                    "name": item["name"],
+                    "score": score,
+                    "price": indicators["close"],
+                    "reasons": reasons,
+                })
+
+        if not results:
+            return "⚠️ 未筛选到明显满足条件的股票，请放宽条件或更换关键词"
+
+        results = sorted(results, key=lambda x: x["score"], reverse=True)[: max_results]
+
+        output = f"🎯 选股结果 - '{keyword}'\n"
+        output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        for idx, row in enumerate(results, start=1):
+            reason_text = "、".join(row["reasons"]) if row["reasons"] else "技术面偏强"
+            output += f"{idx}. {row['symbol']} {row['name']}\n"
+            output += f"   评分: {row['score']}  现价: {row['price']:.2f}\n"
+            output += f"   理由: {reason_text}\n"
+        output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        output += "⚠️ 以上结果基于技术面筛选，不构成投资建议\n"
+        return output
+    except Exception as e:
+        return f"❌ 选股失败: {str(e)}"
 
 
 @tool

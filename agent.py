@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from config import API_KEY, BASE_URL, MODEL_NAME, TEMPERATURE
 
 # 导入工具
-from tools.stock_data import get_stock_info, get_realtime_quote, search_stock, get_kline_data, calculate_indicators, get_stock_news, get_financial_data, analyze_trend
+from tools.stock_data import get_stock_info, get_realtime_quote, search_stock, get_kline_data, calculate_indicators, get_stock_news, get_financial_data, analyze_trend, select_stocks
 
 # 导入提示词
 from prompts.system import STOCK_AGENT_PROMPT
@@ -41,6 +41,7 @@ def create_stock_agent():
         get_stock_news,
         get_financial_data,
         analyze_trend,
+        select_stocks,
     ]
 
     # 3. 使用 LangGraph 创建 ReAct Agent
@@ -92,6 +93,20 @@ def chat_with_agent():
 
             # 调用 Agent
             result = agent.invoke({"messages": messages})
+
+            # 打印执行步骤（包含中间推理与工具调用）
+            for msg in result.get("messages", []):
+                role = getattr(msg, "type", "") or msg.__class__.__name__
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    print(f"\n🧩 步骤[{role}]: 调用工具")
+                    for call in msg.tool_calls:
+                        name = call.get("name", "")
+                        args = call.get("args", {})
+                        print(f"  - {name}: {args}")
+                elif getattr(msg, "content", ""):
+                    text = msg.content
+                    if text:
+                        print(f"\n🧩 步骤[{role}]: {text}")
 
             # 获取最后的 AI 回复
             ai_message = result["messages"][-1]
